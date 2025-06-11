@@ -15,3 +15,16 @@ A. They typically encode strings to longer byte sequences, which is bad. For com
 B. `hello! こんにちは!`. Because in this implementation of a function we assume one byte corresponds to one Unicode character.
 
 C. Can take this 2 bytes (`\xe3\x81`) from 3 that encode `こ`. They don't represent any character together or by themselves.
+
+## Train_bpe_tinystories
+
+A. It took 29 minutes with 8 GB RAM. The longest tokens are `[b' accomplishment', b' disappointment', b' responsibility']`. It makes sense, because these are pretty common long words.
+
+B. The part that takes the longest is pretokenization (without multiprocessing). It takes 
+
+
+## Train_bpe_expts_owt
+
+A.  WILL TRAIN SOON
+
+B.  WILL TRAIN SOON

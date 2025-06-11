@@ -7,10 +7,21 @@
 # z = bytes([1]) + bytes([2])
 # print(type(z), z)
 # print(bytes([])
-
-a = (4, "0".encode("utf-8"), "0".encode("utf-8"))
-b = (4, "u".encode("utf-8"), "n".encode("utf-8"))
-print(max(a,b))
-a = (4, "0", "0")
-b = (4, "u", "n")
-print(max(a,b))
+import cProfile
+import pstats
+import pickle
+import re
+from tokenizer import Tokenizer
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+  
+# tokenizer = Tokenizer.from_files("/home/zizto/Alex/my_tokenizer_TineStories.pkl")
+# print(tokenizer.vocab)
+# print(tokenizer.merges)
+text= "Hello, how <|endoftext|><|endoftext|> are you?<|endoftext|>"
+special_tokens=["<|endoftext|>", "<|endoftext|><|endoftext|>"]
+escaped_tokens = [re.escape(token) for token in special_tokens]
+delimiter = "|".join(escaped_tokens)
+new_pattern = f"{delimiter}|{PAT}"
+print(new_pattern)
+matches = re.findall(new_pattern, text)
+print(matches)
