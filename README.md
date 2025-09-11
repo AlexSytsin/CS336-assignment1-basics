@@ -1,5 +1,4 @@
 # CS336 Spring 2025 Assignment 1: Basics
-42
 ### Answers to written questions:
 [Answers.md](./Answers.md)
 

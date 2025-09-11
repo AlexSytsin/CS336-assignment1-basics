@@ -1,6 +1,0 @@
-Plan to implement tokenization:
-
-1) Pre-tokenization
-1.1) Multiprocessing Pre-tokenization
-
-2)

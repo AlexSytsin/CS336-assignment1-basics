@@ -3,8 +3,9 @@ import os
 from typing import BinaryIO, Iterable, Iterator
 from sortedcontainers import SortedSet
 import pickle
-import cProfile
-import pstats
+import time
+import multiprocessing
+import argparse
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     
@@ -28,13 +29,13 @@ class Tokenizer:
         self.vocab = vocab
         self.merges = merges
         if special_tokens:
-            for token in special_tokens:
-                self.vocab[len(self.vocab)] = token.encode('utf-8')
-            if "<|endoftext|>" not in special_tokens:
-                special_tokens.append("<|endoftext|>")
+            for special_token in special_tokens:
+                byte_encoded_special_token = special_token.encode("utf-8")
+                if byte_encoded_special_token not in set(vocab.values()):
+                    vocab[len(vocab)] = byte_encoded_special_token
+            special_tokens = set(special_tokens)
         else:
-            special_tokens  = ["<|endoftext|>"]
-        special_tokens = set(special_tokens)
+            special_tokens = set()
         self.special_tokens = special_tokens
         self.reversed_vocab = {value : key for key, value in self.vocab.items()}
 
@@ -60,37 +61,40 @@ class Tokenizer:
         """
         Encode an input text into a sequence of token IDs.
         """
-        escaped_tokens = [re.escape(token) for token in self.special_tokens]
-        delimiter = "|".join(escaped_tokens)
-        new_pattern = f"{delimiter}|{PAT}"
-        iter = re.finditer(new_pattern, text)
+        if self.special_tokens:
+            escaped_tokens = [re.escape(token) for token in sorted(self.special_tokens, reverse=True, key=len)]
+            delimiter = "|".join(escaped_tokens)
+            
+            chunks_and_special_tokens = re.split(f"({delimiter})", text)
+        else:
+            chunks_and_special_tokens = [text]
         answer = []
-        for pretoken_obj in iter:
-            pretoken = pretoken_obj.group()
-            if pretoken in self.special_tokens:
-                answer.append(self.reversed_vocab[pretoken.encode("utf-8")])
-                continue
-            pretoken_bytes = pretoken.encode("utf-8")
-            cur = []
-            for byte in pretoken_bytes:
-                cur.append(bytes([byte]))
-            for merge in self.merges:
-                new_cur = []
-                i = 0
-                while i < len(cur):
-                    if i < len(cur) - 1 and (cur[i], cur[i + 1]) == merge:
-                        new_cur.append(cur[i] + cur[i + 1])
-                        i += 2
-                    else:
-                        new_cur.append(cur[i])
-                        i += 1
-                cur = new_cur
-            cur_answer = [self.reversed_vocab[el] for el in cur]
-            answer.extend(cur_answer)
-
+        for chunk in chunks_and_special_tokens:
+            if chunk in self.special_tokens:
+                answer.append(self.reversed_vocab[chunk.encode("utf-8")])
+            else:
+                iter = re.finditer(PAT, chunk)
+                for pretoken_obj in iter:
+                    pretoken = pretoken_obj.group()
+                    pretoken_bytes = pretoken.encode("utf-8")
+                    cur = []
+                    for byte in pretoken_bytes:
+                        cur.append(bytes([byte]))
+                    for merge in self.merges:
+                        new_cur = []
+                        i = 0
+                        while i < len(cur):
+                            if i < len(cur) - 1 and (cur[i], cur[i + 1]) == merge:
+                                new_cur.append(cur[i] + cur[i + 1])
+                                i += 2
+                            else:
+                                new_cur.append(cur[i])
+                                i += 1
+                        cur = new_cur
+                    cur_answer = [self.reversed_vocab[el] for el in cur]
+                    answer.extend(cur_answer)
         return answer
-
-    
+  
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]: 
         """Given an iterable of
         strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This is
@@ -99,7 +103,8 @@ class Tokenizer:
         """
 
         for str in iterable:
-            yield self.encode(str)
+            for id in self.encode(str):
+                yield id
 
     def decode(self, ids: list[int]) -> str: 
         """
@@ -221,31 +226,38 @@ def train_bpe(
         vocab[len(vocab)] = token.encode("utf-8")
 
     # chunk and pretokenize
-    profiler = cProfile.Profile()
-    profiler.enable()
+    start_time = time.time()
 
     split_special_token = "<|endoftext|>".encode("utf-8")
     pretoken_counts = {}
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes, split_special_token)
 
+        end_time = time.time()
+        print(f"-> Time for Chunkation: {end_time - start_time:.4f} seconds")
+
+        start_time = time.time()
+        args_for_processes = []
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            local_pretoken_counts = pretokenize(chunk, special_tokens)
-            for pretoken in local_pretoken_counts:
-                pretoken_counts[pretoken] = pretoken_counts.get(pretoken, 0) + local_pretoken_counts[pretoken]
+            args_for_processes.append((chunk, special_tokens))
+
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        # Run pre-tokenization on your chunk and store the counts for each pre-token
+        list_of_counts = pool.starmap(pretokenize, args_for_processes)
+
+    for local_pretoken_counts in list_of_counts:
+        for pretoken in local_pretoken_counts:
+            pretoken_counts[pretoken] = pretoken_counts.get(pretoken, 0) + local_pretoken_counts[pretoken]
     
-    profiler.disable()
-    time = pstats.Stats(profiler).total_tt
-    print(f"-> Time for Chunkation and Pretokenization: {time:.4f} seconds")
+    end_time = time.time()
+    print(f"-> Time for Pretokenization: {end_time - start_time:.4f} seconds")
 
 
 
     # token pair counts
-    profiler = cProfile.Profile()
-    profiler.enable()
+    start_time = time.time()
 
     pair_counts_sorted = SortedSet() # sorted set of tuples (count, tok1, tok2) 
     map_pair_to_pretokens = dict()
@@ -261,14 +273,12 @@ def train_bpe(
     for tok_pair, count in map_pair_to_count.items():
         pair_counts_sorted.add((count, tok_pair[0], tok_pair[1]))
 
-    profiler.disable()
-    time = pstats.Stats(profiler).total_tt
-    print(f"-> Time for Pretoken Counting: {time:.4f} seconds")
+    end_time = time.time()
+    print(f"-> Time for Token Pair Counting: {end_time - start_time:.4f} seconds")
 
 
     # main tokenization loop
-    profiler = cProfile.Profile()
-    profiler.enable()
+    start_time = time.time()
 
     while len(vocab) != vocab_size:
         top_pair = pair_counts_sorted.pop()
@@ -317,13 +327,13 @@ def train_bpe(
         del map_pair_to_pretokens[top_pair]
         del map_pair_to_count[top_pair]
 
-    profiler.disable()
-    time = pstats.Stats(profiler).total_tt
-    print(f"-> Time for Tokenization: {time:.4f} seconds")
+    end_time = time.time()
+    print(f"-> Time for Main Tokenization: {end_time - start_time:.4f} seconds")
 
     return vocab, merges
 
 def serialize_with_pickle(vocab, merges, filename):
+    os.makedirs(os.path.split(filename)[0], exist_ok=True)
     model = {"vocab": vocab, "merges": merges}
     with open(filename, 'wb') as f:
         pickle.dump(model, f)
@@ -333,7 +343,14 @@ def deserialize_with_pickle(filename):
         model = pickle.load(f)
     return model['vocab'], model['merges']
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="A simple script that greets the user.")
+    parser.add_argument("--dataset", type=str, required=True, help="The path to dataset")
+    parser.add_argument("--vocab-size", type=int, required=True, help="The size of learnt vocabulary")
+    parser.add_argument("--num-processes", type=int, required=True, help="The number of processes spawn during pretokenization step")
+    parser.add_argument("--output-file", type=str, required=True, help="The path where to store learnt tokenizer")
 
-# vocab, merges = train_bpe("/home/zizto/Alex/CS336/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt", 10000, ["<|endoftext|>"], 100)
-# FILENAME_PICKLE = "my_tokenizer_TineStories2.pkl"
-# serialize_with_pickle(vocab, merges, FILENAME_PICKLE)
+    args = parser.parse_args()
+
+    vocab, merges = train_bpe(args.dataset, args.vocab_size, ["<|endoftext|>"], args.num_processes) # "data/TinyStoriesV2-GPT4-train.txt", 10000, ["<|endoftext|>"], 10
+    serialize_with_pickle(vocab, merges, args.output_file)
