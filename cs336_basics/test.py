@@ -1,6 +1,8 @@
 # from tokenizer import pretokenize
 # from sortedcontainers import SortedDict
-
+import einops
+import torch
+import numpy
 # string = "okfこん"
 
 # byte = string.encode("utf-8")
@@ -217,11 +219,23 @@ tokenizer = Tokenizer.from_files("/Users/alex/CS336/CS336-assignment1-basics/tok
 # print(new_pattern)
 # matches = re.findall(new_pattern, text)
 # print(matches)
-special_tokens = set([" "])
-escaped_tokens = [re.escape(token) for token in sorted(special_tokens, reverse=True, key=len)]
-delimiter = "|".join(escaped_tokens)
-print(delimiter)
-print(f"({delimiter})")
-chunks_and_special_tokens = re.split(f"({delimiter})", text)
-print(len(chunks_and_special_tokens))
+# special_tokens = set([" "])
+# escaped_tokens = [re.escape(token) for token in sorted(special_tokens, reverse=True, key=len)]
+# delimiter = "|".join(escaped_tokens)
+# print(delimiter)
+# print(f"({delimiter})")
+# chunks_and_special_tokens = re.split(f"({delimiter})", text)
+# print(len(chunks_and_special_tokens))
 
+import einops #version 0.8.1
+import torch 
+
+a = torch.ones(3,2)
+b = torch.ones(2)
+c = einops.einsum(a, b, "out_dim in_dim, in_dim -> out_dim")
+typo_c = einops.einsum(a, b, "out_dim in_dim, in_dimm -> out_dim in_dim")
+print(a)
+print(b)
+print(c)
+print(typo_c)
+assert (c == typo_c).all()
