@@ -6,8 +6,11 @@ import pickle
 import time
 import multiprocessing
 import argparse
+import numpy as np
+import tempfile
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+COMPILED_PAT = re.compile(PAT)
     
 
 class Tokenizer:
@@ -38,6 +41,9 @@ class Tokenizer:
             special_tokens = set()
         self.special_tokens = special_tokens
         self.reversed_vocab = {value : key for key, value in self.vocab.items()}
+        
+        # Build merge lookup for O(1) access and priority ordering
+        self.merge_priority = {pair: idx for idx, pair in enumerate(self.merges)}
 
     @classmethod
     def from_files(
@@ -57,43 +63,53 @@ class Tokenizer:
         vocab, merges = deserialize_with_pickle(tokenizer_filepath)
         return cls(vocab, merges, special_tokens)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str) -> np.ndarray:
         """
         Encode an input text into a sequence of token IDs.
+        
+        Args:
+            text: Input text to encode
+        
+        Returns:
+            np.ndarray of token IDs (dtype=uint16)
         """
+        # Initialize cache if not already present (for encode_file)
+        if not hasattr(self, 'pretoken_cache'):
+            self.pretoken_cache = {}
+        
+        # Handle special tokens
         if self.special_tokens:
             escaped_tokens = [re.escape(token) for token in sorted(self.special_tokens, reverse=True, key=len)]
             delimiter = "|".join(escaped_tokens)
-            
             chunks_and_special_tokens = re.split(f"({delimiter})", text)
         else:
             chunks_and_special_tokens = [text]
-        answer = []
+        
+        # Collect numpy arrays to concatenate at the end
+        answer_arrays = []
         for chunk in chunks_and_special_tokens:
-            if chunk in self.special_tokens:
-                answer.append(self.reversed_vocab[chunk.encode("utf-8")])
+            if self.special_tokens and chunk in self.special_tokens:
+                # Special token - create single element array
+                token_id = self.reversed_vocab[chunk.encode("utf-8")]
+                answer_arrays.append(np.array([token_id], dtype=np.uint16))
             else:
-                iter = re.finditer(PAT, chunk)
-                for pretoken_obj in iter:
+                # Use pre-compiled regex pattern
+                for pretoken_obj in COMPILED_PAT.finditer(chunk):
                     pretoken = pretoken_obj.group()
                     pretoken_bytes = pretoken.encode("utf-8")
-                    cur = []
-                    for byte in pretoken_bytes:
-                        cur.append(bytes([byte]))
-                    for merge in self.merges:
-                        new_cur = []
-                        i = 0
-                        while i < len(cur):
-                            if i < len(cur) - 1 and (cur[i], cur[i + 1]) == merge:
-                                new_cur.append(cur[i] + cur[i + 1])
-                                i += 2
-                            else:
-                                new_cur.append(cur[i])
-                                i += 1
-                        cur = new_cur
-                    cur_answer = [self.reversed_vocab[el] for el in cur]
-                    answer.extend(cur_answer)
-        return answer
+                    cached = self.pretoken_cache.get(pretoken_bytes)
+                    if cached is None:
+                        cached = self._merge_pretoken(pretoken_bytes)
+                        self.pretoken_cache[pretoken_bytes] = cached
+                    answer_arrays.append(cached)
+        
+        # Concatenate all arrays efficiently
+        if not answer_arrays:
+            return np.array([], dtype=np.uint16).tolist()
+        return np.concatenate(answer_arrays).tolist()
+    
+    def encode_normal(self, text: str) -> list[int]:
+        return self.encode(text).tolist()
   
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]: 
         """Given an iterable of
@@ -103,17 +119,136 @@ class Tokenizer:
         """
 
         for str in iterable:
-            for id in self.encode(str):
-                yield id
+            token_ids = self.encode(str)
+            for id in token_ids:
+                yield int(id)
 
-    def decode(self, ids: list[int]) -> str: 
+    def decode(self, ids: list[int] | np.ndarray) -> str: 
         """
         Decode a sequence of token IDs into text.
         """
         answ = b''
         for id in ids:
-            answ += self.vocab[id]
+            answ += self.vocab[int(id)]
         return answ.decode('utf-8', 'replace')
+    
+    def encode_file(self, file_path: str, output_path: str, chunk_size_bytes: int = 1_000_000_000) -> None:
+        """
+        Encode a large file into token IDs and save to a numpy file.
+        Uses file-based chunking to avoid memory overflow.
+        
+        Args:
+            file_path: Path to input text file
+            output_path: Path to save tokenized output (.npy)
+            chunk_size_bytes: Target size of each text chunk in bytes (default 1GB)
+        """
+        # Get file size and calculate chunk boundaries
+        with open(file_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+            f.seek(0)
+            
+            if file_size == 0:
+                np.save(output_path, np.array([], dtype=np.uint16))
+                return
+            
+            desired_num_chunks = max(1, file_size // chunk_size_bytes)
+            split_special_token = "<|endoftext|>".encode("utf-8")
+            boundaries = find_chunk_boundaries(f, desired_num_chunks, split_special_token)
+        
+        # Initialize persistent cache for all chunks
+        self.pretoken_cache: dict[bytes, np.ndarray] = {}
+        
+        # Process each chunk and save to temp files
+        temp_files = []
+        chunk_token_counts = []
+        
+        try:
+            for i, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+                if start == end:
+                    continue
+                
+                # Read chunk
+                with open(file_path, 'rb') as f:
+                    f.seek(start)
+                    chunk_bytes = f.read(end - start)
+                    if not chunk_bytes:
+                        continue
+                    chunk_text = chunk_bytes.decode('utf-8', errors='ignore')
+                
+                # Encode chunk (uses persistent cache)
+                chunk_tokens = self.encode(chunk_text)
+                
+                # Save to temp file
+                temp_file = tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.npy')
+                np.save(temp_file, chunk_tokens)
+                temp_file.close()
+                
+                temp_files.append(temp_file.name)
+                chunk_token_counts.append(len(chunk_tokens))
+            
+            # Calculate total token count
+            total_tokens = sum(chunk_token_counts)
+            
+            if total_tokens == 0:
+                np.save(output_path, np.array([], dtype=np.uint16))
+                return
+            
+            # Write chunks directly to output file sequentially
+            # This avoids loading everything into memory
+            with open(output_path, 'wb') as out_f:
+                # Write numpy .npy header manually
+                header = {
+                    'descr': np.dtype(np.uint16).descr[0][1],
+                    'fortran_order': False,
+                    'shape': (total_tokens,)
+                }
+                np.lib.format.write_array_header_2_0(out_f, header)
+                
+                # Append each chunk's data
+                for temp_file_path in temp_files:
+                    chunk_data = np.load(temp_file_path)
+                    chunk_data.tofile(out_f)
+                    del chunk_data  # Free immediately
+        
+        finally:
+            # Clean up temp files
+            for temp_file_path in temp_files:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+            
+            # Clean up cache
+            if hasattr(self, 'pretoken_cache'):
+                del self.pretoken_cache
+    
+    def _merge_pretoken(self, pretoken_bytes: bytes) -> np.ndarray:
+        """
+        Apply BPE merges to a single pretoken.
+        
+        Args:
+            pretoken_bytes: Byte representation of pretoken
+        
+        Returns:
+            np.ndarray of token IDs after merging (dtype=uint16)
+        """
+        cur = [bytes([byte]) for byte in pretoken_bytes]
+
+        while len(cur) > 1:
+            best_idx = -1
+            best_priority = len(self.merge_priority)
+            for i in range(len(cur) - 1):
+                pair = (cur[i], cur[i + 1])
+                priority = self.merge_priority.get(pair)
+                if priority is None:
+                    continue
+                if priority < best_priority:
+                    best_priority = priority
+                    best_idx = i
+            if best_idx == -1:
+                break
+            cur = cur[:best_idx] + [cur[best_idx] + cur[best_idx + 1]] + cur[best_idx + 2:]
+
+        return np.array([self.reversed_vocab[token_bytes] for token_bytes in cur], dtype=np.uint16)
 
 class Pretoken:
     def __init__(self, tokens: bytes):
@@ -144,7 +279,7 @@ def find_chunk_boundaries(
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
     chunk_boundaries[-1] = file_size
 
-    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+    mini_chunk_size = 131072  # Read ahead by 4k bytes at a time
 
     for bi in range(1, len(chunk_boundaries) - 1):
         initial_position = chunk_boundaries[bi]
